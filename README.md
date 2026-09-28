@@ -29,9 +29,9 @@ brew install --cask imakarov/tap/shiftswitch
 **Manual:** download `ShiftSwitch-x.y.z.dmg` from [Releases](https://github.com/imakarov/shiftswitch/releases/latest),
 drag ShiftSwitch to Applications, launch it.
 
-On first launch macOS asks for **Accessibility** access
-(System Settings → Privacy & Security → Accessibility → ShiftSwitch). It is needed to see keystrokes and to retype
-the word. Turn on *Launch at Login* in the menu bar icon.
+On first launch macOS asks for **Accessibility** and **Input Monitoring** access
+(System Settings → Privacy & Security → Accessibility / Input Monitoring → ShiftSwitch). They are needed to see
+keystrokes and to retype the word. Turn on *Launch at Login* in the menu bar icon.
 
 Requires macOS 13 Ventura or later, Apple Silicon or Intel.
 
@@ -70,6 +70,7 @@ failure modes collected from their changelogs, support forums and the issue trac
 | First letters come out in the old layout / swapped letters after switching | waits for the layout switch to take effect; every synthetic key event also carries its Unicode string |
 | Electron apps (Slack, VS Code, Telegram Desktop) drop fast synthetic keystrokes | events are spaced by 1.5 ms |
 | With 3+ layouts the "next" layout is the wrong one | toggles to the previously used layout |
+| Keys typed right after the tap land in the middle of the word being retyped (first letters stay unconverted) | keys typed during a conversion are held back and replayed in order right after it |
 | Event tap silently stops after a system timeout | re-enabled automatically |
 | Popup about Secure Input steals focus while you type a password | status is shown by the menu bar icon only |
 | Heavy, bundled extras, telemetry | ~300 KB universal binary, ~11 MB RAM, 0% CPU at idle |
@@ -86,7 +87,13 @@ app's menu (Terminal → Secure Keyboard Entry / iTerm2 → Secure Keyboard Entr
 ```bash
 # Maximum Shift press duration that counts as a tap (default 300 ms)
 defaults write us.imakarov.shiftswitch tapThresholdMs -int 250
+
+# Diagnostics log → ~/Library/Logs/ShiftSwitch.log (timings and counts only, never typed text)
+defaults write us.imakarov.shiftswitch debugLog -bool YES
 ```
+
+ShiftSwitch needs two permissions: **Accessibility** (to retype) and **Input Monitoring** (to see keystrokes).
+If one is missing, the menu bar icon shows ⚠ and the menu says which one.
 
 ## Build from source
 

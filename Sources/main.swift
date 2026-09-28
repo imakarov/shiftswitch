@@ -8,6 +8,7 @@ import ServiceManagement
 // MARK: - Constants
 
 private let kMarker: Int64 = 0x5348_4657          // tags our own synthetic events ("SHFW")
+private let kReplay: Int64 = 0x5348_5250          // tags user keys held back during a conversion and replayed
 private let kShiftL = CGKeyCode(kVK_Shift), kShiftR = CGKeyCode(kVK_RightShift)
 private let kBackspace = CGKeyCode(kVK_Delete), kSpace = CGKeyCode(kVK_Space)
 private let kMaxWord = 128
@@ -19,6 +20,17 @@ private let kSponsor = URL(string: "https://github.com/sponsors/imakarov")!
 /// Russian UI when the system prefers Russian, English otherwise.
 private let isRU = Locale.preferredLanguages.first?.hasPrefix("ru") ?? false
 private func L(_ ru: String, _ en: String) -> String { isRU ? ru : en }
+
+/// Opt-in diagnostics (`defaults write us.imakarov.shiftswitch debugLog -bool YES`) → ~/Library/Logs/ShiftSwitch.log.
+/// Timings and counts only — never typed characters.
+private let debugLog = UserDefaults.standard.bool(forKey: "debugLog")
+private let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/ShiftSwitch.log")
+private func log(_ msg: @autoclosure () -> String) {
+    guard debugLog else { return }
+    let line = "\(Date().formatted(.iso8601)) \(msg())\n"
+    if let h = try? FileHandle(forWritingTo: logURL) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+    else { try? line.write(to: logURL, atomically: true, encoding: .utf8) }
+}
 
 // MARK: - Keyboard layouts (TIS / UCKeyTranslate). Main thread only.
 
@@ -134,6 +146,7 @@ private final class Engine {
     private var expectedID: String?
 
     private var busy = false
+    private var held: [(CGKeyCode, CGEventFlags)] = []   // real keys typed during a conversion, replayed after it
     private let postQueue = DispatchQueue(label: "shiftswitch.post", qos: .userInteractive)
 
     init() {
@@ -165,7 +178,7 @@ private final class Engine {
         guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                         eventsOfInterest: mask, callback: { _, type, event, ctx in
             Unmanaged<Engine>.fromOpaque(ctx!).takeUnretainedValue().handle(type, event)
-            return Unmanaged.passUnretained(event)
+                ? Unmanaged.passUnretained(event) : nil
         }, userInfo: me) else { return false }
         tap = t
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0)
@@ -174,17 +187,26 @@ private final class Engine {
         return true
     }
 
-    private func handle(_ type: CGEventType, _ e: CGEvent) {
+    /// Returns false to swallow the event.
+    private func handle(_ type: CGEventType, _ e: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }   // macOS disables slow taps; turn it back on
+            log("tap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "user input")")
             shiftCandidate = false
             reset()
-            return
+            return true
         }
-        if e.getIntegerValueField(.eventSourceUserData) == kMarker { return }
-        if type == .flagsChanged { onFlags(e); return }
+        let tag = e.getIntegerValueField(.eventSourceUserData)
+        if tag == kMarker { return true }
+        if type == .flagsChanged { onFlags(e); return true }
+        // Keys typed while we erase and retype would land in the middle of the word: hold them, replay after.
+        if type == .keyDown && busy && tag != kReplay {
+            held.append((CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode)), e.flags))
+            return false
+        }
         shiftCandidate = false              // Shift+letter = capital, Shift+click = selection: not a tap
         if type == .keyDown { onKey(e) } else { reset() }   // mouse click moved the caret
+        return true
     }
 
     private func onFlags(_ e: CGEvent) {
@@ -203,7 +225,7 @@ private final class Engine {
         } else if !f.contains(.maskShift) && shiftDown {
             shiftDown = false
             if shiftCandidate && enabled && now - shiftDownAt < tapThreshold {
-                DispatchQueue.main.async { self.convert() }
+                convert()                   // synchronously: from here on, typed keys are held back
             }
             shiftCandidate = false
         } else {
@@ -259,14 +281,42 @@ private final class Engine {
         }
         busy = true
         deadState = 0
+        let t0 = ProcessInfo.processInfo.systemUptime
         TISSelectInputSource(target)
         waitForLayout(targetID, tries: 20) {
+            let t1 = ProcessInfo.processInfo.systemUptime
             self.postQueue.async {
                 let src = CGEventSource(stateID: .privateState)
                 for _ in 0..<erase { Self.post(src, kBackspace, [], nil) }
                 for (key, flags, str) in typed { Self.post(src, key, flags, str) }
-                DispatchQueue.main.async { self.busy = false }
+                let t2 = ProcessInfo.processInfo.systemUptime
+                DispatchQueue.main.async {
+                    log(String(format: "convert: %d keys, erase %d, layout wait %.0f ms, retype %.0f ms, held %d",
+                               strokes.count, erase, (t1 - t0) * 1000, (t2 - t1) * 1000, self.held.count))
+                    self.replayHeld()
+                }
             }
+        }
+    }
+
+    /// Re-post held keys in order (plain key codes: they type in the new layout), then end the conversion.
+    /// Keys typed during the replay are held too and go out in the next round, so order is always preserved.
+    private func replayHeld() {
+        guard !held.isEmpty else { busy = false; return }
+        let batch = held
+        held.removeAll()
+        postQueue.async {
+            let src = CGEventSource(stateID: .privateState)
+            for (key, flags) in batch {
+                for down in [true, false] {
+                    guard let ev = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) else { continue }
+                    ev.flags = flags
+                    ev.setIntegerValueField(.eventSourceUserData, value: kReplay)
+                    ev.post(tap: .cghidEventTap)
+                    usleep(1_500)
+                }
+            }
+            DispatchQueue.main.async { self.replayHeld() }
         }
     }
 
@@ -359,14 +409,38 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let symbol = switch state {
         case .noAccess, .noInputMonitoring: "exclamationmark.triangle"
         case .secureInput: "lock.fill"
-        case .disabled: "keyboard.badge.ellipsis"
-        case .active: "keyboard"
+        case .disabled: "shiftkey.disabled"
+        case .active: "shiftkey"
         }
         guard symbol != shownSymbol else { return }
         shownSymbol = symbol
-        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "ShiftSwitch")
-        img?.isTemplate = true
-        item.button?.image = img
+        item.button?.image = symbol.hasPrefix("shiftkey")
+            ? Self.shiftKeyIcon(alpha: state == .active ? 1 : 0.35)
+            : NSImage(systemSymbolName: symbol, accessibilityDescription: "ShiftSwitch")
+        item.button?.image?.isTemplate = true
+    }
+
+    /// Menu bar glyph matching the app icon: a keycap outline with a Shift arrow (template, adapts to light/dark).
+    private static func shiftKeyIcon(alpha: CGFloat) -> NSImage {
+        NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            NSColor.black.withAlphaComponent(alpha).set()
+            let cap = NSBezierPath(roundedRect: NSRect(x: 1.5, y: 1.5, width: 15, height: 15), xRadius: 4, yRadius: 4)
+            cap.lineWidth = 1.5
+            cap.stroke()
+            let arrow = NSBezierPath()
+            arrow.move(to: NSPoint(x: 9, y: 13.5))
+            arrow.line(to: NSPoint(x: 13.5, y: 9))
+            arrow.line(to: NSPoint(x: 11, y: 9))
+            arrow.line(to: NSPoint(x: 11, y: 5))
+            arrow.line(to: NSPoint(x: 7, y: 5))
+            arrow.line(to: NSPoint(x: 7, y: 9))
+            arrow.line(to: NSPoint(x: 4.5, y: 9))
+            arrow.close()
+            arrow.lineWidth = 1.3
+            arrow.lineJoinStyle = .round
+            arrow.stroke()
+            return true
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
