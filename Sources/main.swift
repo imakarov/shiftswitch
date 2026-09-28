@@ -33,9 +33,11 @@ private enum Layouts {
         return Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue() as String
     }
 
+    /// A real copy of the layout's key map: the CFData belongs to the input source and must not outlive it.
     static func data(_ s: TISInputSource) -> Data? {
         guard let p = TISGetInputSourceProperty(s, kTISPropertyUnicodeKeyLayoutData) else { return nil }
-        return Unmanaged<CFData>.fromOpaque(p).takeUnretainedValue() as Data
+        let cf = Unmanaged<CFData>.fromOpaque(p).takeUnretainedValue()
+        return Data(bytes: CFDataGetBytePtr(cf), count: CFDataGetLength(cf))
     }
 
     static func current() -> TISInputSource { TISCopyCurrentKeyboardInputSource().takeRetainedValue() }
@@ -316,7 +318,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(enabledItem)
         menu.addItem(loginItem)
         menu.addItem(.separator())
-        menu.addItem(withTitle: L("Настройки Accessibility…", "Accessibility Settings…"), action: #selector(openAX),
+        menu.addItem(withTitle: L("Разрешения…", "Permissions…"), action: #selector(openAX),
                      keyEquivalent: "").target = self
         menu.addItem(.separator())
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
@@ -336,16 +338,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         let trusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
         if trusted { engine.start() }
+        if !CGPreflightListenEventAccess() { CGRequestListenEventAccess() }   // adds us to Input Monitoring + prompts
         // Poll: start the tap once permission is granted; keep the icon in sync with Secure Input.
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
         timer?.tolerance = 1
         tick()
     }
 
-    private enum State { case noAccess, secureInput, disabled, active }
+    private enum State { case noAccess, noInputMonitoring, secureInput, disabled, active }
 
     private var state: State {
         if !engine.tapActive { return .noAccess }
+        if !CGPreflightListenEventAccess() { return .noInputMonitoring }   // without it keyDowns never reach the tap
         if SecureInput.isOn { return .secureInput }
         return engine.enabled ? .active : .disabled
     }
@@ -353,7 +357,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func tick() {
         if !engine.tapActive && AXIsProcessTrusted() { engine.start() }
         let symbol = switch state {
-        case .noAccess: "exclamationmark.triangle"
+        case .noAccess, .noInputMonitoring: "exclamationmark.triangle"
         case .secureInput: "lock.fill"
         case .disabled: "keyboard.badge.ellipsis"
         case .active: "keyboard"
@@ -368,6 +372,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     func menuWillOpen(_ menu: NSMenu) {
         status.title = switch state {
         case .noAccess: L("Нет доступа Accessibility", "No Accessibility permission")
+        case .noInputMonitoring: L("Нет доступа «Мониторинг ввода»", "No Input Monitoring permission")
         case .secureInput: L("Secure Input: \(SecureInput.owner() ?? "?") блокирует ввод",
                              "Secure Input: \(SecureInput.owner() ?? "?") blocks typing")
         case .disabled: L("Выключено", "Disabled")
@@ -396,7 +401,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func openAX() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        let pane = state == .noInputMonitoring ? "Privacy_ListenEvent" : "Privacy_Accessibility"
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!)
     }
 }
 
