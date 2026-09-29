@@ -45,12 +45,32 @@ Tap Shift again to undo.
 |---|---|
 | Short Shift tap after a word | retypes the last word (everything since the last space) in the other layout |
 | …with spaces after the word | converts the word, keeps the spaces |
+| Select text in an editor or browser field, tap Shift | the whole selection is retyped in the other layout and stays selected |
 | Tap Shift again | converts back |
 | Tap Shift with nothing typed | just switches the layout |
 | Shift+letter, long Shift hold, Shift+⌘/⌃/⌥, Shift+click | nothing — these are normal Shift uses |
 
 The word buffer is reset by a mouse click, arrows, Home/End/PgUp/PgDn, Return, Tab, Esc, any ⌘/⌃/⌥ shortcut,
 switching apps, or switching the layout manually. Backspace edits the buffer.
+
+### Selected text
+
+Select any text in a text field (TextEdit, Notes, Mail, Safari, Chrome, Slack, VS Code…) and tap Shift — the
+selection is converted as a whole (`Ghbdtn, vbh!` → `Привет, мир!`), stays selected, and the layout switches.
+The direction is picked from the letters (Latin → other layout, Cyrillic → other layout); digits, emoji and line
+breaks are kept.
+
+It never guesses. The selection is converted only when **all** of these hold, otherwise the last word is
+converted as usual:
+
+- nothing was typed since the caret last moved — selecting (click, Shift+arrows, ⌘A, double-click) always moves
+  it, so an inline autocomplete suggestion while you type is never mistaken for a selection;
+- macOS Accessibility reports a non-empty selection in an **editable** field — a selection on a plain web page is
+  ignored (typing there would fire the site's keyboard shortcuts);
+- the app is not a terminal.
+
+Apps that don't expose their selection to Accessibility simply keep the last-word behaviour. For Chromium/Electron
+apps ShiftSwitch turns on their accessibility tree (`AXManualAccessibility`) the first time it looks.
 
 **What it deliberately does not do:** no automatic switching while you type, no dictionaries, no clipboard,
 no network access, no telemetry, no keystroke logging. The only thing kept in memory is the last word.

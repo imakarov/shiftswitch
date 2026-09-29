@@ -94,10 +94,83 @@ private enum Layouts {
         return translate(s, layout, dead: &dead).isEmpty && dead != 0
     }
 
+    /// Character → the key (and Shift state) that types it in a layout. Main row wins over the keypad.
+    static func charMap(_ layout: Data) -> [Character: Stroke] {
+        var m: [Character: Stroke] = [:]
+        for shift in [false, true] {
+            for k in 0..<128 {
+                let s = Stroke(key: CGKeyCode(k), shift: shift, caps: false)
+                let str = translate(s, layout)
+                if str.count == 1, isPrintable(str), let ch = str.first, m[ch] == nil { m[ch] = s }
+            }
+        }
+        return m
+    }
+
+    /// Retypes already-written text as if its keys had been pressed in the other layout. The source layout is the
+    /// one whose keys produce more of the text's letters (Latin → English, Cyrillic → Russian); characters that
+    /// aren't on the source layout (digits on other keys, emoji, newlines…) are kept as they are.
+    static func convertText(_ text: String, _ a: (TISInputSource, Data), _ b: (TISInputSource, Data))
+        -> (text: String, target: TISInputSource, targetData: Data) {
+        let ma = charMap(a.1), mb = charMap(b.1)
+        let score = { (m: [Character: Stroke]) in text.filter { $0.isLetter && m[$0] != nil }.count }
+        let (srcMap, dst) = score(ma) >= score(mb) ? (ma, b) : (mb, a)
+        let out = String(text.map { ch -> String in
+            guard let st = srcMap[ch] else { return String(ch) }
+            let t = translate(st, dst.1)
+            return t.isEmpty ? String(ch) : t
+        }.joined())
+        return (out, dst.0, dst.1)
+    }
+
     /// Return, Tab, Esc, arrows, Home/End, F-keys… translate to control or private-use (0xF7xx) characters.
     static func isPrintable(_ str: String) -> Bool {
         guard let u = str.unicodeScalars.first else { return false }
         return ![.control, .privateUse].contains(u.properties.generalCategory)
+    }
+}
+
+// MARK: - Selected text (Accessibility)
+
+private enum Selection {
+    static let maxLength = 2000
+    /// Terminals: selection there is not editable text; never retype into it.
+    static let terminals: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
+        "dev.warp.Warp-Stable", "net.kovidgoyal.kitty", "org.alacritty", "io.alacritty", "com.github.wez.wezterm"]
+    static let editableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+    private static var manualAX: Set<pid_t> = []
+
+    private static func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
+        var v: CFTypeRef?
+        return AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success ? v : nil
+    }
+
+    /// The selected text of the focused editable field in the frontmost app, or nil when there is none — or when
+    /// the app doesn't tell (then we fall back to the last word). Call off the main thread: AX can block.
+    static func current() -> String? {
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              !terminals.contains(front.bundleIdentifier ?? "") else { return nil }
+        let app = AXUIElementCreateApplication(front.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        // Chromium/Electron build their accessibility tree only when asked to, and WebKit answers the very first
+        // query of a page lazily: on the first look at a process, ask for the tree and retry once.
+        if !manualAX.contains(front.processIdentifier) {
+            manualAX.insert(front.processIdentifier)
+            AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            if let sel = selected(in: app) { return sel }
+            usleep(150_000)
+        }
+        return selected(in: app)
+    }
+
+    private static func selected(in app: AXUIElement) -> String? {
+        guard let f = attr(app, kAXFocusedUIElementAttribute), CFGetTypeID(f) == AXUIElementGetTypeID() else { return nil }
+        let el = f as! AXUIElement
+        guard let sel = attr(el, kAXSelectedTextAttribute) as? String, !sel.isEmpty, sel.count <= maxLength else { return nil }
+        // Only editable text: retyping over a selection on a plain web page would fire the site's key shortcuts.
+        let role = attr(el, kAXRoleAttribute) as? String ?? ""
+        guard editableRoles.contains(role) || attr(el, "AXEditableAncestor") != nil else { return nil }
+        return sel
     }
 }
 
@@ -148,6 +221,7 @@ private final class Engine {
     private var busy = false
     private var held: [(CGKeyCode, CGEventFlags)] = []   // real keys typed during a conversion, replayed after it
     private let postQueue = DispatchQueue(label: "shiftswitch.post", qos: .userInteractive)
+    private let selectionQueue = DispatchQueue(label: "shiftswitch.ax", qos: .userInteractive)
 
     init() {
         UserDefaults.standard.register(defaults: ["enabled": true, "tapThresholdMs": 300])
@@ -266,12 +340,25 @@ private final class Engine {
     private func convert() {
         guard !busy, let target = Layouts.other(previous: previousID) else { return }
         let targetID = Layouts.id(target)
-        expectedID = targetID
-        let strokes = buf
-        guard !strokes.isEmpty, let layout = Layouts.data(target) else {
-            TISSelectInputSource(target)    // nothing typed yet: just switch the layout
+        if buf.isEmpty {
+            // Nothing typed since the caret last moved. Selecting text always moves it (click, Shift+arrows, ⌘A),
+            // so a selection now is the user's — convert it. A "selection" while the buffer is non-empty is inline
+            // autocomplete and is ignored: the typed word wins.
+            busy = true
+            selectionQueue.async {
+                let sel = Selection.current()
+                DispatchQueue.main.async {
+                    if let sel, self.convertSelection(sel) { return }
+                    self.expectedID = targetID
+                    TISSelectInputSource(target)   // no selection: just switch the layout
+                    self.replayHeld()
+                }
+            }
             return
         }
+        expectedID = targetID
+        let strokes = buf
+        guard let layout = Layouts.data(target) else { return }
         // A trailing dead key is shown as a pending accent; one Backspace cancels it too.
         let erase = strokes.filter(\.onScreen).count + (strokes.last?.onScreen == false ? 1 : 0)
         // Key code + its Unicode string for the target layout. Keys that are dead in the target layout are sent
@@ -318,6 +405,39 @@ private final class Engine {
             }
             DispatchQueue.main.async { self.replayHeld() }
         }
+    }
+
+    /// Retype the selection in the other layout (typing replaces a selection in any editor — no clipboard), then
+    /// select the result again so another tap converts it back. Returns false if there is nothing to change.
+    private func convertSelection(_ text: String) -> Bool {
+        guard let other = Layouts.other(previous: previousID),
+              let curData = Layouts.data(Layouts.current()), let otherData = Layouts.data(other) else { return false }
+        let r = Layouts.convertText(text, (Layouts.current(), curData), (other, otherData))
+        guard r.text != text else { return false }
+        let dstMap = Layouts.charMap(r.targetData)
+        let typed: [(CGKeyCode, CGEventFlags, String?)] = r.text.map { ch in
+            if ch == "\n" || ch == "\r\n" || ch == "\r" { return (CGKeyCode(kVK_Return), .maskShift, nil) }  // line break, not "send"
+            guard let st = dstMap[ch], !Layouts.isDeadKey(st, r.targetData) else { return (0, [], String(ch)) }
+            return (st.key, st.shift ? .maskShift : [], String(ch))
+        }
+        let targetID = Layouts.id(r.target)
+        expectedID = targetID
+        reset()
+        let t0 = ProcessInfo.processInfo.systemUptime
+        TISSelectInputSource(r.target)
+        waitForLayout(targetID, tries: 20) {
+            self.postQueue.async {
+                let src = CGEventSource(stateID: .privateState)
+                for (key, flags, str) in typed { Self.post(src, key, flags, str) }
+                for _ in typed { Self.post(src, CGKeyCode(kVK_LeftArrow), .maskShift, nil) }   // reselect
+                let t1 = ProcessInfo.processInfo.systemUptime
+                DispatchQueue.main.async {
+                    log(String(format: "selection: %d chars, %.0f ms, held %d", typed.count, (t1 - t0) * 1000, self.held.count))
+                    self.replayHeld()
+                }
+            }
+        }
+        return true
     }
 
     /// Layout switching is asynchronous: poll (on main, as TIS requires) until it has taken effect, max ~200 ms.
