@@ -45,7 +45,7 @@ Tap Shift again to undo.
 |---|---|
 | Short Shift tap after a word | retypes the last word (everything since the last space) in the other layout |
 | …with spaces after the word | converts the word, keeps the spaces |
-| Select text in an editor or browser field, tap Shift | the whole selection is retyped in the other layout and stays selected |
+| Select text in an editor or browser field, tap Shift | the whole selection is retyped in the other layout, caret at its end |
 | Tap Shift again | converts back |
 | Tap Shift with nothing typed | just switches the layout |
 | Shift+letter, long Shift hold, Shift+⌘/⌃/⌥, Shift+click | nothing — these are normal Shift uses |
@@ -56,7 +56,8 @@ switching apps, or switching the layout manually. Backspace edits the buffer.
 ### Selected text
 
 Select any text in a text field (TextEdit, Notes, Mail, Safari, Chrome, Slack, VS Code…) and tap Shift — the
-selection is converted as a whole (`Ghbdtn, vbh!` → `Привет, мир!`), stays selected, and the layout switches.
+selection is converted as a whole (`Ghbdtn, vbh!` → `Привет, мир!`), the caret lands at its end so you can keep
+typing, and the layout switches. Tap Shift again right away to undo.
 The direction is picked from the letters (Latin → other layout, Cyrillic → other layout); digits, emoji and line
 breaks are kept.
 

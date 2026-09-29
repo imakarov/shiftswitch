@@ -220,6 +220,9 @@ private final class Engine {
 
     private var busy = false
     private var held: [(CGKeyCode, CGEventFlags)] = []   // real keys typed during a conversion, replayed after it
+    // Last converted selection (what we typed, what was there), so an immediate second tap undoes it.
+    // Any key or click forgets it.
+    private var undo: (typed: String, original: String)?
     private let postQueue = DispatchQueue(label: "shiftswitch.post", qos: .userInteractive)
     private let selectionQueue = DispatchQueue(label: "shiftswitch.ax", qos: .userInteractive)
 
@@ -273,6 +276,7 @@ private final class Engine {
         let tag = e.getIntegerValueField(.eventSourceUserData)
         if tag == kMarker { return true }
         if type == .flagsChanged { onFlags(e); return true }
+        if !busy || tag == kReplay { undo = nil }   // the user typed or clicked after a selection conversion
         // Keys typed while we erase and retype would land in the middle of the word: hold them, replay after.
         if type == .keyDown && busy && tag != kReplay {
             held.append((CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode)), e.flags))
@@ -340,6 +344,14 @@ private final class Engine {
     private func convert() {
         guard !busy, let target = Layouts.other(previous: previousID) else { return }
         let targetID = Layouts.id(target)
+        if buf.isEmpty, let u = undo {
+            // Second tap right after a selection conversion: put the original text back.
+            undo = nil
+            busy = true
+            guard let data = Layouts.data(target) else { busy = false; return }
+            replaceText(erase: u.typed.count, with: u.original, target: target, data: data, remember: nil)
+            return
+        }
         if buf.isEmpty {
             // Nothing typed since the caret last moved. Selecting text always moves it (click, Shift+arrows, ⌘A),
             // so a selection now is the user's — convert it. A "selection" while the buffer is non-empty is inline
@@ -414,30 +426,38 @@ private final class Engine {
               let curData = Layouts.data(Layouts.current()), let otherData = Layouts.data(other) else { return false }
         let r = Layouts.convertText(text, (Layouts.current(), curData), (other, otherData))
         guard r.text != text else { return false }
-        let dstMap = Layouts.charMap(r.targetData)
-        let typed: [(CGKeyCode, CGEventFlags, String?)] = r.text.map { ch in
-            if ch == "\n" || ch == "\r\n" || ch == "\r" { return (CGKeyCode(kVK_Return), .maskShift, nil) }  // line break, not "send"
-            guard let st = dstMap[ch], !Layouts.isDeadKey(st, r.targetData) else { return (0, [], String(ch)) }
+        // Typing replaces the selection; the caret ends up after the new text, ready to keep typing.
+        replaceText(erase: 0, with: r.text, target: r.target, data: r.targetData, remember: text)
+        return true
+    }
+
+    /// Switch to `target`, erase `erase` characters, type `text` (Unicode events; line breaks as Shift+Return so
+    /// chats don't send). `remember` = the text being replaced, kept for an undo by the next tap.
+    private func replaceText(erase: Int, with text: String, target: TISInputSource, data: Data, remember: String?) {
+        let dstMap = Layouts.charMap(data)
+        let typed: [(CGKeyCode, CGEventFlags, String?)] = text.map { ch in
+            if ch == "\n" || ch == "\r\n" || ch == "\r" { return (CGKeyCode(kVK_Return), .maskShift, nil) }
+            guard let st = dstMap[ch], !Layouts.isDeadKey(st, data) else { return (0, [], String(ch)) }
             return (st.key, st.shift ? .maskShift : [], String(ch))
         }
-        let targetID = Layouts.id(r.target)
+        let targetID = Layouts.id(target)
         expectedID = targetID
         reset()
         let t0 = ProcessInfo.processInfo.systemUptime
-        TISSelectInputSource(r.target)
+        TISSelectInputSource(target)
         waitForLayout(targetID, tries: 20) {
             self.postQueue.async {
                 let src = CGEventSource(stateID: .privateState)
+                for _ in 0..<erase { Self.post(src, kBackspace, [], nil) }
                 for (key, flags, str) in typed { Self.post(src, key, flags, str) }
-                for _ in typed { Self.post(src, CGKeyCode(kVK_LeftArrow), .maskShift, nil) }   // reselect
                 let t1 = ProcessInfo.processInfo.systemUptime
                 DispatchQueue.main.async {
-                    log(String(format: "selection: %d chars, %.0f ms, held %d", typed.count, (t1 - t0) * 1000, self.held.count))
-                    self.replayHeld()
+                    log(String(format: "text: erase %d, type %d, %.0f ms, held %d", erase, typed.count, (t1 - t0) * 1000, self.held.count))
+                    if let remember { self.undo = (text, remember) }
+                    self.replayHeld()   // replayed keys clear `undo` again, as any typing does
                 }
             }
         }
-        return true
     }
 
     /// Layout switching is asynchronous: poll (on main, as TIS requires) until it has taken effect, max ~200 ms.
