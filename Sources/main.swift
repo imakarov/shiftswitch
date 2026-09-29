@@ -166,14 +166,19 @@ private enum Selection {
     /// clipboard, no key shortcut. Returns false if the item isn't there. Blocks: call off the main thread.
     static func pressService(in app: AXUIElement) -> Bool {
         func children(_ e: AXUIElement) -> [AXUIElement] { attr(e, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
-        func item(_ menuOwner: AXUIElement, _ title: String) -> AXUIElement? {
-            children(menuOwner).flatMap(children).first { attr($0, kAXTitleAttribute) as? String == title }
+        func items(_ menuOwner: AXUIElement) -> [AXUIElement] { children(menuOwner).flatMap(children) }
+        guard let bar = attr(app, kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID() else {
+            log("service: no menu bar"); return false
         }
-        guard let bar = attr(app, kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID() else { return false }
         let top = children(bar as! AXUIElement)
-        guard top.count > 1, let services = item(top[1], "Services"),     // top[0] is the Apple menu
-              let ours = item(services, serviceTitle) else { return false }
-        return AXUIElementPerformAction(ours, kAXPressAction as CFString) == .success
+        guard top.count > 1 else { log("service: empty menu bar"); return false }
+        // The Services submenu is localized ("Services", "Службы", "Dienste"…): find it by our item inside, in any
+        // submenu of the app menu (top[0] is the Apple menu). The item only exists while text is selected.
+        let ours = items(top[1]).lazy.flatMap(items).first { attr($0, kAXTitleAttribute) as? String == serviceTitle }
+        guard let ours else { log("service: item not in the app menu (no selection, or service disabled)"); return false }
+        let r = AXUIElementPerformAction(ours, kAXPressAction as CFString)
+        log("service: pressed, AX result \(r.rawValue)")
+        return r == .success
     }
     static let serviceTitle = "ShiftSwitch: Convert Layout"
 
@@ -398,6 +403,7 @@ private final class Engine {
                 case .text(let sel):
                     DispatchQueue.main.async { if !self.convertSelection(sel) { noSelection() } }
                 case .opaque(let app):
+                    log("selection: app exposes no accessibility tree, trying the service")
                     DispatchQueue.main.async { self.servicePending = true }
                     let pressed = Selection.pressService(in: app)
                     // The service call (if there is a selection) arrives on main; otherwise give up shortly.
