@@ -70,8 +70,12 @@ converted as usual:
   ignored (typing there would fire the site's keyboard shortcuts);
 - the app is not a terminal.
 
-Apps that don't expose their selection to Accessibility simply keep the last-word behaviour. For Chromium/Electron
-apps ShiftSwitch turns on their accessibility tree (`AXManualAccessibility`) the first time it looks.
+For Chromium/Electron apps ShiftSwitch turns on their accessibility tree (`AXManualAccessibility`) the first time
+it looks. Apps that expose no accessibility tree at all (e.g. the ChatGPT desktop app) are handled through a macOS
+**Service**: ShiftSwitch presses *App → Services → ShiftSwitch: Convert Layout* in the app's menu bar, the app hands
+over its selection on a private pasteboard and replaces it with the converted text. With nothing selected the
+service is not called at all, and your clipboard is never touched. The same service is available from the
+Services menu (and can get a shortcut in System Settings → Keyboard → Keyboard Shortcuts → Services).
 
 **What it deliberately does not do:** no automatic switching while you type, no dictionaries, no clipboard,
 no network access, no telemetry, no keystroke logging. The only thing kept in memory is the last word.

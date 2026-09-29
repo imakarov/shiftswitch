@@ -147,6 +147,36 @@ private enum Selection {
 
     /// The selected text of the focused editable field in the frontmost app, or nil when there is none — or when
     /// the app doesn't tell (then we fall back to the last word). Call off the main thread: AX can block.
+    enum Probe { case text(String), none, opaque(AXUIElement) }
+
+    /// What the frontmost app says about its selection: the text, "no selection", or `opaque` — it exposes no
+    /// accessibility tree for its content at all (e.g. the ChatGPT app), so we can't tell from here.
+    static func probe() -> Probe {
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              !terminals.contains(front.bundleIdentifier ?? "") else { return .none }
+        let app = AXUIElementCreateApplication(front.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        if let sel = current() { return .text(sel) }
+        return attr(app, kAXFocusedUIElementAttribute) == nil ? .opaque(app) : .none
+    }
+
+    /// Fallback for opaque apps: press "<App> → Services → ShiftSwitch: Convert Layout" through the menu bar,
+    /// which apps keep accessible. The app then hands its selection to our service over a private pasteboard
+    /// and replaces it with what we return; with nothing selected the service is simply not called. No
+    /// clipboard, no key shortcut. Returns false if the item isn't there. Blocks: call off the main thread.
+    static func pressService(in app: AXUIElement) -> Bool {
+        func children(_ e: AXUIElement) -> [AXUIElement] { attr(e, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+        func item(_ menuOwner: AXUIElement, _ title: String) -> AXUIElement? {
+            children(menuOwner).flatMap(children).first { attr($0, kAXTitleAttribute) as? String == title }
+        }
+        guard let bar = attr(app, kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID() else { return false }
+        let top = children(bar as! AXUIElement)
+        guard top.count > 1, let services = item(top[1], "Services"),     // top[0] is the Apple menu
+              let ours = item(services, serviceTitle) else { return false }
+        return AXUIElementPerformAction(ours, kAXPressAction as CFString) == .success
+    }
+    static let serviceTitle = "ShiftSwitch: Convert Layout"
+
     static func current() -> String? {
         guard let front = NSWorkspace.shared.frontmostApplication,
               !terminals.contains(front.bundleIdentifier ?? "") else { return nil }
@@ -223,6 +253,7 @@ private final class Engine {
     // Last converted selection (what we typed, what was there), so an immediate second tap undoes it.
     // Any key or click forgets it.
     private var undo: (typed: String, original: String)?
+    private var servicePending = false
     private let postQueue = DispatchQueue(label: "shiftswitch.post", qos: .userInteractive)
     private let selectionQueue = DispatchQueue(label: "shiftswitch.ax", qos: .userInteractive)
 
@@ -357,13 +388,26 @@ private final class Engine {
             // so a selection now is the user's — convert it. A "selection" while the buffer is non-empty is inline
             // autocomplete and is ignored: the typed word wins.
             busy = true
+            let noSelection = {
+                self.expectedID = targetID
+                TISSelectInputSource(target)       // no selection: just switch the layout
+                self.replayHeld()
+            }
             selectionQueue.async {
-                let sel = Selection.current()
-                DispatchQueue.main.async {
-                    if let sel, self.convertSelection(sel) { return }
-                    self.expectedID = targetID
-                    TISSelectInputSource(target)   // no selection: just switch the layout
-                    self.replayHeld()
+                switch Selection.probe() {
+                case .text(let sel):
+                    DispatchQueue.main.async { if !self.convertSelection(sel) { noSelection() } }
+                case .opaque(let app):
+                    DispatchQueue.main.async { self.servicePending = true }
+                    let pressed = Selection.pressService(in: app)
+                    // The service call (if there is a selection) arrives on main; otherwise give up shortly.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + (pressed ? 0.4 : 0)) {
+                        guard self.servicePending else { return }
+                        self.servicePending = false
+                        noSelection()
+                    }
+                case .none:
+                    DispatchQueue.main.async { noSelection() }
                 }
             }
             return
@@ -460,6 +504,25 @@ private final class Engine {
         }
     }
 
+    /// "ShiftSwitch: Convert Layout" service: the app gave us its selection; return it converted — the app
+    /// replaces the selection itself. Works from the Services menu too, not only via our Shift fallback.
+    func serviceConvert(_ text: String) -> String? {
+        let fromTap = servicePending
+        servicePending = false
+        defer { if fromTap { replayHeld() } }
+        guard let other = Layouts.other(previous: previousID),
+              let curData = Layouts.data(Layouts.current()), let otherData = Layouts.data(other) else { return nil }
+        let r = Layouts.convertText(text, (Layouts.current(), curData), (other, otherData))
+        guard r.text != text else { return nil }
+        expectedID = Layouts.id(r.target)
+        reset()
+        TISSelectInputSource(r.target)
+        // No undo record here: we can't see whether the app really replaced its selection (Chromium may hand us a
+        // selection that was collapsed a moment ago and then insert nothing), and undo erases with Backspace.
+        log("service: \(text.count) chars")
+        return r.text
+    }
+
     /// Layout switching is asynchronous: poll (on main, as TIS requires) until it has taken effect, max ~200 ms.
     private func waitForLayout(_ id: String, tries: Int, then work: @escaping () -> Void) {
         if tries == 0 || Layouts.id(Layouts.current()) == id {
@@ -486,6 +549,18 @@ private final class Engine {
 
 // MARK: - Menu bar UI
 
+/// NSServices entry point (see NSServices in Info.plist).
+private final class ServiceProvider: NSObject {
+    let engine: Engine
+    init(_ engine: Engine) { self.engine = engine }
+
+    @objc func convertLayout(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        guard let text = pboard.string(forType: .string), let out = engine.serviceConvert(text) else { return }
+        pboard.clearContents()
+        pboard.setString(out, forType: .string)
+    }
+}
+
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let engine = Engine()
     private var item: NSStatusItem!
@@ -496,7 +571,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let loginItem = NSMenuItem(title: L("Запускать при входе", "Launch at Login"), action: #selector(toggleLogin),
                                        keyEquivalent: "")
 
+    private lazy var services = ServiceProvider(engine)
+
     func applicationDidFinishLaunching(_ n: Notification) {
+        NSApp.servicesProvider = services
+        NSUpdateDynamicServices()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         let menu = NSMenu()
         menu.delegate = self
